@@ -18,6 +18,16 @@ const client = new APIManager(Deno.env.get('BOT_TOKEN')!, {
     intents: GatewayIntent.GUILD_MESSAGES
   }
 })
+const TTSCommand = new Deno.Command(
+  '/Users/helloyunho/miniforge3/envs/arisu/bin/python3',
+  {
+    args: ['run_tts.py'],
+    cwd: 'VITS/',
+    stdout: 'piped',
+    stdin: 'piped'
+  }
+)
+const TTSProcess = TTSCommand.spawn()
 
 const openAI = new OpenAI()
 const listeningChannels: string[] = []
@@ -50,13 +60,57 @@ const createResponse = async (cid: string, content?: string) => {
   await client.post(`/channels/${cid}/typing`)
 
   const resp = await openAI.createChat('gpt-4', chats, {})
-  const text = resp.choices[0].message.content
+  const [text, jaTranslated] = resp.choices[0].message.content!.split('------')
+
+  const textEncoder = new TextEncoder()
+  const textBytes = textEncoder.encode(jaTranslated.trim() + '\n')
+  const writer = TTSProcess.stdin.getWriter()
+  writer.write(textBytes)
+  writer.releaseLock()
+  // @ts-ignore: ES2023 feature
+  const TTSBuffer = new ArrayBuffer(0, { maxByteLength: 1073741824 })
+  const TTSView = new DataView(TTSBuffer)
+  for await (const chunk of TTSProcess.stdout.values({ preventCancel: true })) {
+    if (chunk.byteLength > 0) {
+      const checkLast10 = chunk.slice(-1)
+      if (checkLast10[0] === 10) {
+        const buffer = chunk.slice(0, -1)
+        const bufferLength = buffer.byteLength
+        let idx = TTSBuffer.byteLength
+        // @ts-ignore: ES2023 feature
+        TTSBuffer.resize(idx + bufferLength)
+        for (; idx < TTSBuffer.byteLength; idx++) {
+          TTSView.setUint8(idx, buffer[idx])
+        }
+        break
+      } else {
+        const bufferLength = chunk.byteLength
+        let idx = TTSBuffer.byteLength
+        // @ts-ignore: ES2023 feature
+        TTSBuffer.resize(idx + bufferLength)
+        for (; idx < TTSBuffer.byteLength; idx++) {
+          TTSView.setUint8(idx, chunk[idx])
+        }
+      }
+    }
+  }
+
+  const textDecoder = new TextDecoder()
+  const TTSPath = textDecoder.decode(TTSBuffer)
+
+  const formdata = new FormData()
+  formdata.append(
+    'files[0]',
+    new Blob([await Deno.readFile(TTSPath)], { type: 'audio/wav' }),
+    'tts.wav'
+  )
+  formdata.append('content', text.trim())
 
   await client.post(`/channels/${cid}/messages`, {
-    body: {
-      content: text
-    }
+    body: formdata
   })
+
+  await Deno.remove(TTSPath)
 }
 
 client.spawnAndRunAll()
